@@ -1,19 +1,31 @@
 """
 stew_pipeline.py
 
-Download the STEW (Simultaneous Task EEG Workload) dataset from Kaggle,
-segment each subject's resting ("lo") and multitasking ("hi") recordings
-into fixed-length epochs, extract per-channel band-power features, and
-save the resulting (X, y, groups) arrays to a compressed .npz file.
+Load the STEW (Simultaneous Task EEG Workload) dataset -- as distributed on
+Kaggle in pre-packaged .mat form -- segment each subject's SIMKAP-multitasking
+recording into fixed-length epochs, extract per-channel band-power features,
+and save the resulting (X, y, groups) arrays to a compressed .npz file.
 
 Dataset
 -------
 Kaggle: mitulahirwal/mental-cognitive-workload-eeg-data-stew-dataset
-48 subjects, each with two files:
-    subNN_lo.txt  -> ~2.5 min resting-state EEG
-    subNN_hi.txt  -> ~2.5 min EEG during the SIMKAP multitasking test
-Recorded with a 14-channel Emotiv EPOC headset at 128 Hz. Each row is one
-sample; each column is one channel, in this order:
+This mirror packages the original 48-subject STEW recordings (Emotiv EPOC,
+14 channels, 128 Hz, 2.5 min SIMKAP multitasking task) as four .mat files,
+after dropping 3 subjects (5, 24, 42) whose subjective ratings are missing:
+
+    dataset.mat            -> "dataset", shape (14, 19200, 45)
+                               14 channels x 19200 samples x 45 subjects
+    rating.mat              -> "rating", shape (45, 1)
+                               subjective workload rating, 1-9 scale
+    class_012.mat            -> "class_012", shape (45, 1)
+                               3-class label derived from rating:
+                                 0 = normal   (rating 4-5)
+                                 1 = moderate (rating 6-7)
+                                 2 = high     (rating 8-9)
+    three_class_one_hot.mat -> "three_class_one_hot", shape (45, 3)
+                               one-hot encoding of class_012 (unused here)
+
+Channel order is assumed to match the original STEW recordings:
     AF3, F7, F3, FC5, T7, P7, O1, O2, P8, T8, FC6, F4, F8, AF4
 
 Usage
@@ -21,8 +33,10 @@ Usage
     python stew_pipeline.py
 
 Configuration is done via the constants below, or environment variables:
-    STEW_DATA_DIR  -> where raw .txt files live / will be downloaded to
-    STEW_OUT_PATH  -> where to write the features .npz
+    STEW_DATA_DIR    -> where the .mat files live / will be downloaded to
+    STEW_OUT_PATH    -> where to write the features .npz
+    STEW_LABEL_MODE  -> "three_class" (default) or "two_class"
+                        two_class: 0 = normal (rating <= 6), 1 = high (rating >= 7)
 
 Requirements
 ------------
@@ -34,8 +48,8 @@ Kaggle auth (only needed for auto-download)
     KAGGLE_KEY environment variables. See https://www.kaggle.com/docs/api
 
 If you already have the dataset on disk, just point DATA_DIR at the folder
-containing the subNN_lo/hi.txt files and download_stew() will be skipped
-automatically.
+containing dataset.mat / rating.mat / class_012.mat and download_stew() will
+be skipped automatically.
 """
 
 from __future__ import annotations
@@ -44,6 +58,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+from scipy.io import loadmat
 from scipy.signal import welch
 
 # --------------------------------------------------------------------------- #
@@ -52,11 +67,16 @@ from scipy.signal import welch
 
 KAGGLE_DATASET = "mitulahirwal/mental-cognitive-workload-eeg-data-stew-dataset"
 
-# Where the raw STEW .txt files live (or will be downloaded to).
+# Where the .mat files live (or will be downloaded to).
 DATA_DIR = Path(os.environ.get("STEW_DATA_DIR", "data/stew"))
 
 # Where to write the extracted feature/label arrays.
 OUT_PATH = Path(os.environ.get("STEW_OUT_PATH", "data/stew_features.npz"))
+
+# "three_class" (0/1/2, per class_012.mat) or "two_class" (0/1, re-derived from rating).
+LABEL_MODE = os.environ.get("STEW_LABEL_MODE", "three_class")
+
+REQUIRED_FILES = ["dataset.mat", "rating.mat", "class_012.mat"]
 
 CHANNELS = [
     "AF3", "F7", "F3", "FC5", "T7", "P7", "O1",
@@ -75,7 +95,6 @@ BANDS = {
 
 EPOCH_SEC = 2.0       # length of each analysis window, in seconds
 EPOCH_OVERLAP = 0.5   # fraction of overlap between consecutive windows
-LABELS = {"lo": 0, "hi": 1}  # lo = resting, hi = SIMKAP multitasking workload
 
 
 # --------------------------------------------------------------------------- #
@@ -85,9 +104,8 @@ LABELS = {"lo": 0, "hi": 1}  # lo = resting, hi = SIMKAP multitasking workload
 def download_stew(data_dir: Path = DATA_DIR) -> None:
     """Download + unzip the STEW dataset from Kaggle into data_dir, if needed."""
     data_dir = Path(data_dir)
-    existing = list(data_dir.glob("sub*_*.txt")) if data_dir.exists() else []
-    if existing:
-        print(f"Found {len(existing)} existing STEW files in {data_dir}, skipping download.")
+    if data_dir.exists() and all((data_dir / f).exists() for f in REQUIRED_FILES):
+        print(f"Found existing STEW .mat files in {data_dir}, skipping download.")
         return
 
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -100,7 +118,7 @@ def download_stew(data_dir: Path = DATA_DIR) -> None:
             "Install it with `pip install kaggle`, put your API token at "
             "~/.kaggle/kaggle.json, and rerun -- or manually download the "
             f"dataset from https://www.kaggle.com/datasets/{KAGGLE_DATASET} "
-            f"and place the .txt files in {data_dir}."
+            f"and place {REQUIRED_FILES} in {data_dir}."
         ) from exc
 
     print(f"Downloading {KAGGLE_DATASET} to {data_dir} ...")
@@ -109,12 +127,55 @@ def download_stew(data_dir: Path = DATA_DIR) -> None:
     api.dataset_download_files(KAGGLE_DATASET, path=str(data_dir), unzip=True, quiet=False)
 
     # Kaggle sometimes nests files one directory deeper; flatten if so.
-    for nested_path in data_dir.rglob("sub*_*.txt"):
-        target = data_dir / nested_path.name
-        if nested_path != target:
-            nested_path.rename(target)
+    for name in REQUIRED_FILES:
+        nested = next(data_dir.rglob(name), None)
+        if nested and nested != data_dir / name:
+            nested.rename(data_dir / name)
 
     print("Download complete.")
+
+
+# --------------------------------------------------------------------------- #
+# Loading
+# --------------------------------------------------------------------------- #
+
+def load_raw(data_dir: Path = DATA_DIR):
+    """
+    Returns:
+        signals: (n_subjects, n_channels, n_samples) float array
+        rating:  (n_subjects,) int array, 1-9 subjective workload rating
+        class3:  (n_subjects,) int array, 0/1/2 three-class label from class_012.mat
+    """
+    data_dir = Path(data_dir)
+    missing = [f for f in REQUIRED_FILES if not (data_dir / f).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing {missing} in {data_dir}. Call download_stew() first, or "
+            f"point DATA_DIR at an existing copy of the dataset."
+        )
+
+    dataset = loadmat(data_dir / "dataset.mat")["dataset"]  # (14, 19200, 45)
+    signals = np.transpose(dataset, (2, 0, 1))              # (45, 14, 19200)
+
+    rating = loadmat(data_dir / "rating.mat")["rating"].ravel().astype(np.int64)
+    class3 = loadmat(data_dir / "class_012.mat")["class_012"].ravel().astype(np.int64)
+
+    if signals.shape[1] != len(CHANNELS):
+        raise ValueError(
+            f"dataset.mat has {signals.shape[1]} channels, expected {len(CHANNELS)} "
+            f"({CHANNELS})"
+        )
+
+    return signals, rating, class3
+
+
+def compute_labels(rating: np.ndarray, class3: np.ndarray, mode: str = LABEL_MODE) -> np.ndarray:
+    if mode == "three_class":
+        return class3
+    if mode == "two_class":
+        # Per the dataset documentation: normal = rating 4-6, high = rating 7-9.
+        return (rating >= 7).astype(np.int64)
+    raise ValueError(f"Unknown STEW_LABEL_MODE: {mode!r} (expected 'three_class' or 'two_class')")
 
 
 # --------------------------------------------------------------------------- #
@@ -140,70 +201,36 @@ def _band_power(epoch: np.ndarray, fs: int = FS) -> np.ndarray:
 def _epoch_signal(signal: np.ndarray, fs: int = FS,
                    epoch_sec: float = EPOCH_SEC, overlap: float = EPOCH_OVERLAP):
     """
-    signal: (n_samples, n_channels)
+    signal: (n_channels, n_samples)
     Yields (n_channels, epoch_len) windows.
     """
     epoch_len = int(epoch_sec * fs)
     step = max(1, int(epoch_len * (1 - overlap)))
-    n_samples = signal.shape[0]
+    n_samples = signal.shape[-1]
     for start in range(0, n_samples - epoch_len + 1, step):
-        yield signal[start:start + epoch_len].T  # (n_channels, epoch_len)
-
-
-def _load_subject_file(path: Path) -> np.ndarray:
-    """Load a single subNN_lo/hi.txt file -> (n_samples, n_channels) array."""
-    data = np.loadtxt(path)
-    if data.ndim != 2 or data.shape[1] != len(CHANNELS):
-        raise ValueError(
-            f"{path} has shape {data.shape}, expected (n_samples, {len(CHANNELS)}) "
-            f"for channels {CHANNELS}"
-        )
-    return data
+        yield signal[:, start:start + epoch_len]
 
 
 # --------------------------------------------------------------------------- #
 # Build dataset
 # --------------------------------------------------------------------------- #
 
-def build_dataset(data_dir: Path = DATA_DIR):
-    data_dir = Path(data_dir)
-    files = sorted(data_dir.glob("sub*_*.txt"))
-    if not files:
-        raise FileNotFoundError(
-            f"No STEW .txt files found in {data_dir}. Call download_stew() first, "
-            f"or point DATA_DIR at an existing copy of the dataset."
-        )
+def build_dataset(data_dir: Path = DATA_DIR, label_mode: str = LABEL_MODE):
+    signals, rating, class3 = load_raw(data_dir)
+    labels = compute_labels(rating, class3, mode=label_mode)
 
     X, y, groups = [], [], []
 
-    for path in files:
-        stem = path.stem  # e.g. "sub01_lo"
-        parts = stem.split("_")
-        if len(parts) != 2 or parts[1].lower() not in LABELS:
-            print(f"Skipping unrecognized file name: {path.name}")
-            continue
-
-        sub_str, task = parts
-        digits = "".join(ch for ch in sub_str if ch.isdigit())
-        if not digits:
-            print(f"Skipping file with no subject id: {path.name}")
-            continue
-        subject_id = int(digits)
-        label = LABELS[task.lower()]
-
-        signal = _load_subject_file(path)
-
+    for subject_idx in range(signals.shape[0]):
         n_epochs = 0
-        for epoch in _epoch_signal(signal):
+        for epoch in _epoch_signal(signals[subject_idx]):
             X.append(_band_power(epoch))
-            y.append(label)
-            groups.append(subject_id)
+            y.append(labels[subject_idx])
+            groups.append(subject_idx)
             n_epochs += 1
 
-        print(f"{path.name}: subject={subject_id} label={task} epochs={n_epochs}")
-
-    if not X:
-        raise RuntimeError(f"No epochs were extracted from files in {data_dir}.")
+        print(f"subject={subject_idx} rating={rating[subject_idx]} "
+              f"label={labels[subject_idx]} epochs={n_epochs}")
 
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.int64)
@@ -214,7 +241,7 @@ def build_dataset(data_dir: Path = DATA_DIR):
 
 def main():
     download_stew(DATA_DIR)
-    X, y, groups = build_dataset(DATA_DIR)
+    X, y, groups = build_dataset(DATA_DIR, LABEL_MODE)
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -224,11 +251,12 @@ def main():
         groups=groups,
         channels=np.array(CHANNELS),
         bands=np.array(list(BANDS.keys())),
+        label_mode=np.array(LABEL_MODE),
     )
 
     print(f"Saved {X.shape[0]} epochs x {X.shape[1]} features to {OUT_PATH}")
     counts = dict(zip(*np.unique(y, return_counts=True)))
-    print(f"Subjects: {len(np.unique(groups))}, class balance: {counts}")
+    print(f"Subjects: {len(np.unique(groups))}, label_mode={LABEL_MODE}, class balance: {counts}")
 
 
 if __name__ == "__main__":
