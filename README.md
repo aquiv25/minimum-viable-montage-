@@ -1,8 +1,7 @@
 # Minimum Viable Montage — NSRI Summer Research Hackathon 2026
 
 How few EEG channels does a consumer headband actually need to reliably detect
-cognitive overload in a new user? See `project_plan.md` (team plan, in Russian)
-and `methodology_note.md` (methodology, in English) for the full framing.
+cognitive overload in a new user?
 
 ## Start here
 
