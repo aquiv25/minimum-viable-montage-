@@ -32,9 +32,6 @@ data/stew/
   _run_loso_ckpt.py, _run_loso_ablation_ckpt.py    Checkpoint-and-resume LOSO runner scripts (used to produce the ckpt_*.json files)
 
 reference_materials/
-  stew_model_development.ipynb            Teammate's original model-development notebook (raw, unedited)
-  stew_features_two_class_teammate.zip    Teammate's exported feature set (used to verify the 64.4% result independently)
-  stew_baseline_loso.ipynb                Earlier baseline/LOSO exploration notebook
   EEG data summary.pdf                    STEW dataset documentation
 ```
 
