@@ -392,7 +392,7 @@ nb["metadata"] = {
     "language_info": {"name": "python", "version": "3.10"},
 }
 
-with open("/sessions/focused-wonderful-bell/mnt/outputs/minimum_viable_montage_analysis.ipynb", "w") as f:
+with open("minimum_viable_montage_analysis.ipynb", "w") as f:
     nbf.write(nb, f)
 
 print("notebook written, n_cells =", len(cells))
